@@ -314,9 +314,11 @@ downloads every one of their trees. Leave those settings alone, and leave `gc.au
 default so git's own automatic gc can still fold packs.
 
 Hermes keeps the commit-graph current itself, because without one every version lookup walks the
-whole history: a `hermes -w` launch updates a missing or day-old graph in the background with
+whole history: each `hermes update` (after the new code is in place) and each `hermes -w` launch
+update a missing or day-old graph in the background, at most once every 6 hours, with
 `git commit-graph write --reachable --split --no-changed-paths`, which reads commits only and never
-downloads a tree. A `commit-graph.lock` or `multi-pack-index.lock` that a killed git left behind is
+downloads a tree. The update does not wait for it, and a write still running after 10 minutes is
+stopped. A `commit-graph.lock` or `multi-pack-index.lock` that a killed git left behind is
 removed by the same stale-lock sweep as `index.lock` once it is 10 minutes old and no git is running.
 
 Each `hermes update` also spends at most 60 seconds cleaning those packs up, picking up where the

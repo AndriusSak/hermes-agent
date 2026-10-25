@@ -216,6 +216,33 @@ def _refresh_commit_graph(repo_root: str) -> None:
                      env={**noninteractive_git_env(), **NO_LAZY_FETCH_ENV})
 
 
+def _claim_commit_graph_refresh(git_dir: Path) -> bool:
+    return _commit_graph_stale(git_dir) and _claim_repack_slot(git_dir, _COMMIT_GRAPH_LOCK)
+
+
+_REFRESH_CHILD = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                  "from hermes_cli.worktree_ops import _refresh_commit_graph; _refresh_commit_graph(sys.argv[1])")
+
+
+def spawn_commit_graph_refresh(repo_root: Path) -> bool:
+    """Start the bounded commit-graph refresh in a detached child when it is due; never waits.
+
+    ``hermes update`` is the one regular git pass an install checkout gets (``hermes -w`` is
+    rarely launched from it), so without this its version lookups never get a graph. Detached
+    because the write takes seconds and must neither delay the update nor die with it; the child
+    is the same runner the ``-w`` pass uses (niced, process tree killed at the timeout).
+    """
+    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+    git_dir = Path(repo_root) / ".git"
+    if not (git_dir / "objects").is_dir() or not _claim_commit_graph_refresh(git_dir):
+        return False
+    subprocess.Popen([sys.executable, "-c", _REFRESH_CHILD, str(repo_root)], cwd=str(repo_root),
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     close_fds=True, **windows_detach_popen_kwargs())
+    return True
+
+
 def _maintain_pack_health(repo_root: str) -> None:
     """Repack on pack sprawl and keep the commit-graph fresh (background thread, fail-soft).
 
@@ -236,7 +263,7 @@ def _maintain_pack_health(repo_root: str) -> None:
             # Repacking can strand now-duplicated admin files; prune on the same pass.
             _git(["worktree", "prune"], repo_root, timeout=60, check=False,
                  stdin=subprocess.DEVNULL, env=noninteractive_git_env())
-        if _commit_graph_stale(git_dir) and _claim_repack_slot(git_dir, _COMMIT_GRAPH_LOCK):
+        if _claim_commit_graph_refresh(git_dir):
             _refresh_commit_graph(repo_root)
     except Exception as e:
         logger.debug("pack maintenance skipped: %s", e)
