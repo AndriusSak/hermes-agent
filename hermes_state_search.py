@@ -8,6 +8,7 @@ import contextlib
 import logging
 import re
 import sqlite3
+import threading
 import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
@@ -316,9 +317,9 @@ class SessionSearchMixin:
         self._execute_write(_do)
 
     def fts_rebuild_step(self) -> bool:
-        """Backfill one chunk of the deferred FTS rebuild; True while work remains. Chunks are
-        claimed atomically inside the write transaction, so concurrent processes interleave
-        instead of duplicating rows."""
+        """Backfill one chunk (``_fts_chunk_rows`` ids) of the deferred FTS rebuild; True while work
+        remains. Chunks are claimed atomically inside the write transaction, so concurrent processes
+        interleave instead of duplicating rows."""
         if not self._fts_enabled:
             return False
         inserts = [self._CHUNK_INSERT_SQL.format(table="messages_fts", extra="")]
@@ -343,7 +344,7 @@ class SessionSearchMixin:
         if high_water_raw is None:
             return False
         high_water = int(high_water_raw)
-        chunk = self._FTS_REBUILD_CHUNK_ROWS
+        chunk = self._fts_chunk_rows
 
         def _do(conn):
             # Re-reading progress inside the BEGIN IMMEDIATE held by _execute_write IS
@@ -376,17 +377,18 @@ class SessionSearchMixin:
             return False
         return bool(more)
 
-    def _fts_teardown_trash_step(self) -> bool:
-        """Tear down one chunk of a demoted v22 FTS shadow table (a PLAIN table now); True while
-        work remains. INTEGER single-column-key tables drain with a high-water marker so
-        each chunk's scan is bounded (restarting the scan was O(n²)); compound-key tables
-        keep the chunked ``LIMIT`` delete — they are small by construction.
+    def _fts_teardown_trash_step(self, progress: Optional[dict] = None) -> bool:
+        """Tear down one chunk (``_fts_chunk_rows`` rows) of a demoted v22 FTS shadow table (a PLAIN
+        table now); True while work remains. ``progress``, when given, is kept current as {"table", "table_index",
+        "table_count", "drained", "total"} for the table being drained.
 
-        Single-column-key trash tables (the common shape — FTS shadow tables carry a rowid/integer PK) are
-        drained with a high-water marker mirroring :meth:`fts_rebuild_step`: each chunk deletes only rows
-        after the previously-drained key, so the per-chunk scan is bounded instead of re-scanning from the
-        start of the table every chunk (O(n²) total on large trash tables, #79324).
+        Single-column INTEGER-key trash tables (the common shape — FTS shadow tables carry a rowid/integer
+        PK) are drained with a high-water marker mirroring :meth:`fts_rebuild_step`: each chunk deletes only
+        rows after the previously-drained key, so the per-chunk scan is bounded instead of re-scanning from
+        the start of the table every chunk (O(n²) total on large trash tables, #79324). Compound-key tables
+        keep the chunked ``LIMIT`` delete — they are small by construction.
         """
+        limit = self._fts_chunk_rows
         with self._read_ctx() as conn:
             trash = [r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'",
@@ -407,24 +409,22 @@ class SessionSearchMixin:
                 row = _meta_row(conn, marker_key)
                 high_water = int(row[0]) if row is not None else 0
                 # Claim the LAST row of the LIMIT window so a full chunk goes per step.
-                upper_rows = conn.execute(
-                    f"SELECT {key} FROM {tbl} WHERE {key} > ? ORDER BY {key} LIMIT {self._FTS_REBUILD_CHUNK_ROWS}",
-                    (high_water,),
-                ).fetchall()
-                if not upper_rows:
-                    return _drop(conn, marker_key)
-                upper = upper_rows[-1][0]
+                upper_row = conn.execute(
+                    f"SELECT {key} FROM {tbl} WHERE {key} > ? ORDER BY {key} LIMIT 1 OFFSET ?",
+                    (high_water, limit - 1),
+                ).fetchone() or conn.execute(f"SELECT MAX({key}) FROM {tbl} WHERE {key} > ?", (high_water,)).fetchone()
+                if upper_row is None or upper_row[0] is None:
+                    return _drop(conn, marker_key), 0
+                upper = upper_row[0]
                 cur = conn.execute(f"DELETE FROM {tbl} WHERE {key} > ? AND {key} <= ?", (high_water, upper))
                 if cur.rowcount > 0:
                     self.set_meta(marker_key, str(upper), cursor=conn)
-                return True
+                return True, cur.rowcount
             # Compound-key or rowid trash table: legacy chunked delete. These shadow tables are small, so
             # the quadratic re-scan is not a concern (#79324 keeps the high-water path for the big
             # single-key tables).
-            cur = conn.execute(
-                f"DELETE FROM {tbl} WHERE ({key}) IN (SELECT {key} FROM {tbl} LIMIT {self._FTS_REBUILD_CHUNK_ROWS})"
-            )
-            return _drop(conn) if cur.rowcount == 0 else True  # True: more trash tables / chunks may remain
+            cur = conn.execute(f"DELETE FROM {tbl} WHERE ({key}) IN (SELECT {key} FROM {tbl} LIMIT {int(limit)})")
+            return (_drop(conn) if cur.rowcount == 0 else True), cur.rowcount
 
         def _drop(conn, marker_key: Optional[str] = None) -> bool:
             """Drained — the DROP is cheap now. True: re-check for more trash."""
@@ -435,10 +435,33 @@ class SessionSearchMixin:
             return True
 
         try:
-            return bool(self._execute_write(_do))
+            more, deleted = self._execute_write(_do)
         except sqlite3.OperationalError as exc:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
+        if progress is not None:
+            # Counted after the commit: _execute_write may replay _do on contention.
+            progress["drained"] = progress.get("drained", 0) + deleted
+        return bool(more)
+
+    def _fts_teardown_track(self, progress: dict) -> None:
+        """Point *progress* at the trash table the next teardown chunk drains: its position in the run
+        and the rows left in it. One COUNT per table, on the reader (no writer waits on it) and outside
+        the timed chunk (so it never skews the chunk sizing)."""
+        with self._read_ctx() as conn:
+            trash = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'",
+                (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
+            ).fetchall()]
+            if not trash or progress.get("table") == trash[0]:
+                return
+            tbl = trash[0]
+            # Only INTEGER-pk tables (rowid aliases) carry a resume marker; count what is left past it.
+            marker = _meta_row(conn, f"fts_teardown_{tbl}_progress")
+            total = conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE rowid > ?", (int(marker[0]),)).fetchone()[0] \
+                if marker is not None else conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+        count = progress.setdefault("table_count", len(trash))
+        progress.update(table=tbl, table_index=max(1, count - len(trash) + 1), drained=0, total=int(total))
 
     def _fts_cjk_reset_if_stale(self) -> None:
         """From-scratch rebuild of a stale cjk index (triggers were dropped, gap extent unknown):
@@ -608,9 +631,44 @@ class SessionSearchMixin:
                 raise sqlite3.OperationalError(failure_message)
             self._conn.commit()
 
-    def _optimize_vacuum(self) -> bool:
+    def _optimize_progress_info(self, phase: str, track: dict) -> dict[str, Any]:
+        """``progress_cb`` payload: {"phase", "percent", "indexed", "total"} for every phase, plus
+        {"table", "table_index", "table_count"} while tearing down and {"elapsed", "size_bytes",
+        "estimated_bytes"} for the VACUUM (one statement: elapsed time, not a percent)."""
+        if phase == "teardown" and track.get("table"):
+            done, total = track["drained"], track["total"]
+            return {"phase": phase, "percent": min(100, 100 * done // total) if total else 100, "indexed": done,
+                    "total": total, **{k: track[k] for k in ("table", "table_index", "table_count")}}
+        if phase == "vacuum" and "vacuum_started" in track:
+            return {"phase": phase, "percent": 0, "indexed": 0, "total": 0,
+                    "elapsed": time.monotonic() - track["vacuum_started"],
+                    **{k: track[k] for k in ("size_bytes", "estimated_bytes")}}
+        st = self.fts_rebuild_status() or self.fts_cjk_rebuild_status()
+        return {"phase": phase, "percent": st["percent"] if st else 100,
+                "indexed": st["indexed"] if st else 0, "total": st["total"] if st else 0}
+
+    def _optimize_vacuum(self, track: dict, tick: Optional[Callable[[], None]] = None) -> bool:
         """Phase 3: reclaim freed pages to the OS. False when VACUUM failed (usually no free disk
-        for its temp copy; a later VACUUM reclaims)."""
+        for its temp copy; a later VACUUM reclaims). VACUUM is one statement that runs for minutes
+        on a big store, so *tick* is called every second from a side thread to show it is alive;
+        *track* gets the size before and the estimated size after (live pages only)."""
+        with self._lock:
+            page_size, pages, free = (self._conn.execute(f"PRAGMA {p}").fetchone()[0]
+                                      for p in ("page_size", "page_count", "freelist_count"))
+        track.update(vacuum_started=time.monotonic(), size_bytes=pages * page_size,
+                     estimated_bytes=(pages - free) * page_size)
+        stop = threading.Event()
+
+        def _tick() -> None:
+            tick()
+            while not stop.wait(1.0):
+                tick()
+
+        from agent.memory_provider import spawn_context_thread
+
+        ticker = spawn_context_thread(_tick, name="optimize-vacuum-ticker")
+        if tick is not None:
+            ticker.start()
         try:
             with self._lock:
                 self._conn.execute("VACUUM")
@@ -618,6 +676,10 @@ class SessionSearchMixin:
         except sqlite3.OperationalError as exc:
             logger.warning("VACUUM after FTS optimize failed: %s", exc)
             vacuum_ok = False
+        finally:
+            stop.set()
+            if ticker.is_alive():
+                ticker.join()
         # Best-effort WAL fold-back, REFUSED (SQLITE_BUSY) while another connection holds a
         # read-mark (callers size via logical_size_bytes, not stat()). PASSIVE, never TRUNCATE:
         # a TRUNCATE reset from a transient CLI would race a live writer.
@@ -660,8 +722,9 @@ class SessionSearchMixin:
     ) -> dict[str, Any]:
         """Repair an older FTS layout into the current v23 shape, foreground and to completion:
         legacy-v22 inline -> external-content, or a v23 ``messages_fts_trigram`` that still stores
-        ``tool_calls``. Re-running resumes. ``progress_cb`` receives {"phase", "percent",
-        "indexed", "total"}. A missing trigram tokenizer is not fatal (CJK falls back to LIKE)."""
+        ``tool_calls``. Re-running resumes. ``progress_cb`` receives :meth:`_optimize_progress_info`
+        after every chunk and every second of the VACUUM. A missing trigram tokenizer is not fatal
+        (CJK falls back to LIKE)."""
         if not self._fts_enabled:
             return {"ok": False, "reason": "fts5_unavailable"}
         if self.read_only:
@@ -685,32 +748,35 @@ class SessionSearchMixin:
         if self._fts_cjk_loaded:
             self._ensure_cjk_schema_committed()
 
-        def _emit(phase: str) -> None:
-            if progress_cb is None:
-                return
-            st = self.fts_rebuild_status() or self.fts_cjk_rebuild_status()
-            progress_cb({"phase": phase, "percent": st["percent"] if st else 100,
-                         "indexed": st["indexed"] if st else 0, "total": st["total"] if st else 0})
+        track: dict[str, Any] = {}  # teardown table/rows and VACUUM sizes, for progress_cb
 
-        def _drive(phase: str, step) -> None:
-            """Run *step* to completion; the inter-chunk sleep is the single place the duty
-            cycle is enforced — back-to-back BEGIN IMMEDIATE chunks starve a live
-            gateway/CLI out of its lock retries."""
+        def _emit(phase: str) -> None:
+            if progress_cb is not None:
+                progress_cb(self._optimize_progress_info(phase, track))
+
+        def _drive(phase: str, step, before=None, **step_kwargs) -> None:
+            """Run *step* to completion, back to back (no other writer: see the chunk engine
+            note in hermes_state_fts). Chunk size adapts to its measured cost."""
+            self._fts_chunk_rows = self._FTS_REBUILD_CHUNK_ROWS
             while True:
+                if before is not None:
+                    before()
                 _t0 = time.monotonic()
-                if not step():
+                if not step(**step_kwargs):
                     break
+                cost = time.monotonic() - _t0
                 _emit(phase)
-                time.sleep(max(self._FTS_REBUILD_MIN_PAUSE, (time.monotonic() - _t0) * self._FTS_REBUILD_DUTY_FACTOR))
+                self._fts_chunk_rows = self._next_chunk_rows(self._fts_chunk_rows, cost)
 
         # Phase 1: base backfill; 1b: CJK-bigram backfill (own marker pair).
         _emit("backfill")
         _drive("backfill", self.fts_rebuild_step)
-        _emit("backfill")
         _drive("backfill", self.fts_cjk_rebuild_step)
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
+        self._fts_teardown_track(track)
         _emit("teardown")
-        _drive("teardown", self._fts_teardown_trash_step)
+        _drive("teardown", self._fts_teardown_trash_step, before=lambda: self._fts_teardown_track(track),
+               progress=track)
         with self._read_ctx() as conn:
             still_pending = _meta_row(conn, "fts_rebuild_high_water") is not None
             still_trash = self._has_fts_trash(conn)
@@ -723,8 +789,7 @@ class SessionSearchMixin:
 
         vacuum_ok = None
         if vacuum:
-            _emit("vacuum")
-            vacuum_ok = self._optimize_vacuum()
+            vacuum_ok = self._optimize_vacuum(track, None if progress_cb is None else lambda: _emit("vacuum"))
         refusal = self._execute_write(self._optimize_settle)
         if refusal is not None:
             # A concurrent process changed state since the pre-vacuum check; a re-run can still settle.

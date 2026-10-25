@@ -171,8 +171,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "external-content layout. On large databases this reclaims a "
             "large fraction of state.db (the old layout stored duplicate "
             "copies of every message and indexed tool output). Runs "
-            "foreground with a progress bar, throttles so a running gateway "
-            "stays responsive, and VACUUMs at the end. Safe to interrupt and "
+            "foreground with progress for every phase (refusing while a gateway "
+            "or other Hermes process holds state.db) and VACUUMs at the end. Safe to interrupt and "
             "re-run — it resumes where it left off. No conversation data is "
             "changed; only the search index is rebuilt.")
     _flag(sessions_optimize_storage, "--no-vacuum", default=False,
