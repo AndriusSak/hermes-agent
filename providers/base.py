@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -36,6 +37,33 @@ def _profile_user_agent() -> str:
         return f"hermes-cli/{get_version_info().base_version}"
     except Exception:
         return "hermes-cli"
+
+
+class LazyHeaders(Mapping[str, str]):
+    """``default_headers`` built on first read instead of at import.
+
+    A User-Agent carrying the Hermes release resolves it from git in a source checkout, and every
+    CLI start imports all provider plugins (``hermes_cli.config`` lists their env vars), so headers
+    built at import made every command pay git subprocesses for a request it may never send.
+    """
+
+    def __init__(self, build: Callable[[], Mapping[str, str]]) -> None:
+        self._build = build
+        self._headers: dict[str, str] | None = None
+
+    def _resolved(self) -> dict[str, str]:
+        if self._headers is None:
+            self._headers = dict(self._build())
+        return self._headers
+
+    def __getitem__(self, key: str) -> str:
+        return self._resolved()[key]
+
+    def __iter__(self):
+        return iter(self._resolved())
+
+    def __len__(self) -> int:
+        return len(self._resolved())
 
 
 @dataclass
@@ -135,7 +163,7 @@ class ProviderProfile:
     hostname: str = ""
 
     # ── Client-level quirks (set once at client construction) ─
-    default_headers: dict[str, str] = field(default_factory=dict)
+    default_headers: Mapping[str, str] = field(default_factory=dict)
 
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
