@@ -46,14 +46,25 @@ def _run_logging_git(tmp_path: Path, code: str) -> tuple[dict, list[str]]:
     }
     out = subprocess.run(
         [sys.executable, "-c", code], cwd=str(ROOT), env=env, capture_output=True, text=True,
-        encoding="utf-8", timeout=120, check=True, stdin=subprocess.DEVNULL,
+        encoding="utf-8", timeout=120, check=False, stdin=subprocess.DEVNULL,
     )
+    assert out.returncode == 0, out.stderr[-2000:]
     calls = log.read_text(encoding="utf-8-sig").splitlines() if log.exists() else []
     return json.loads(out.stdout.strip().splitlines()[-1]), calls
 
 
 @pytest.mark.platforms("linux", "macos")
-def test_loading_provider_plugins_runs_no_git_until_a_header_is_read(tmp_path):
+def test_provider_headers_run_no_git_until_read_and_cross_the_plugin_host(tmp_path):
+    # A user override copying a bundled profile inherits its lazy headers; under
+    # ``plugins.isolation: host`` they reach the parent only through the profile extraction.
+    override = tmp_path / "gmi-eu"
+    override.mkdir()
+    (override / "__init__.py").write_text(
+        "import dataclasses\n"
+        "from providers import get_provider_profile, register_provider\n"
+        "register_provider(dataclasses.replace(get_provider_profile('gmi'), name='gmi-eu', aliases=()))\n",
+        encoding="utf-8",
+    )
     code = (
         "import json, os, hermes_cli.config, providers\n"
         "providers.list_providers()\n"
@@ -61,13 +72,17 @@ def test_loading_provider_plugins_runs_no_git_until_a_header_is_read(tmp_path):
         "before = open(log, encoding='utf-8-sig').read().splitlines() if os.path.exists(log) else []\n"
         "ua = dict(providers.get_provider_profile('fireworks').default_headers)['User-Agent']\n"
         "from hermes_cli.version_info import get_version_info\n"
-        "print(json.dumps({'before': before, 'ua': ua, 'base': get_version_info().base_version}))\n"
+        "from hermes_cli.plugin_host_profiles import load_hosted_profiles\n"
+        f"hosted, = load_hosted_profiles({str(override)!r}, '_hermes_user_provider_gmi_eu')\n"
+        "print(json.dumps({'before': before, 'ua': ua, 'base': get_version_info().base_version,\n"
+        "                  'hosted': dict(hosted.default_headers)}))\n"
     )
     result, calls = _run_logging_git(tmp_path, code)
 
     assert result["before"] == [], "importing config + every provider plugin spawned git"
     assert result["ua"] == f"HermesAgent/{result['base']}"
     assert calls, "reading the header resolves the release on demand"
+    assert result["hosted"] == {"User-Agent": f"HermesAgent/{result['base']}"}
 
 
 @pytest.mark.platforms("linux", "macos")

@@ -25,6 +25,7 @@ import os
 import sys
 import threading
 import types
+from collections import abc
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -544,6 +545,15 @@ def capture_profiles(path: str, module_name: str) -> list[Any]:
     return captured
 
 
+def _profile_value(value: Any) -> Any:
+    """A profile field as data: a non-dict Mapping (bundled ``LazyHeaders``, which an override copying a
+    bundled profile inherits) resolves here, in the credential-free extraction, rather than crossing as an
+    Opaque placeholder the parent's client builders silently drop."""
+    if isinstance(value, abc.Mapping) and not isinstance(value, dict):
+        return dict(value)
+    return value
+
+
 def describe_profile(profile: Any) -> dict[str, Any]:
     """Profile data (instance fields) plus the methods and callable fields that must run here."""
     from providers.base import ProviderProfile
@@ -555,7 +565,7 @@ def describe_profile(profile: Any) -> dict[str, Any]:
         if callable(value):
             calls[name] = {"async": is_async_callable(value), "sig": describe_signature(value), "field": True}
         else:
-            fields[name] = encode(value)
+            fields[name] = encode(_profile_value(value))
     for name in dir(type(profile)):
         if name.startswith("_") or name in fields or name in calls:
             continue
@@ -563,7 +573,7 @@ def describe_profile(profile: Any) -> dict[str, Any]:
         if attr is getattr(ProviderProfile, name, object()):
             continue
         if isinstance(inspect.getattr_static(profile, name), property) or not callable(attr):
-            fields[name] = encode(getattr(profile, name))
+            fields[name] = encode(_profile_value(getattr(profile, name)))
             continue
         calls[name] = {"async": is_async_callable(attr), "sig": describe_signature(getattr(profile, name)),
                        "field": False}
