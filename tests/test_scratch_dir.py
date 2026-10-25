@@ -22,104 +22,76 @@ from hermes_constants import apply_scratch_tmp_env, get_scratch_dir, prune_scrat
 
 
 @pytest.fixture
-def background_scratch_prune(tmp_path, monkeypatch):
+def blocked_scratch_prune(tmp_path, monkeypatch):
+    """A once-per-process prune that is still due and blocks until released: a caller that
+    waits on it shows up as a stall, one that does not returns at once."""
     import hermes_constants as constants
 
     home = tmp_path / "launch"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(constants, "_scratch_pruned_once", False)
-    monkeypatch.setattr(constants, "_scratch_prune_thread", None)
-    monkeypatch.setattr(constants, "_scratch_prune_lock", threading.Lock())
-    calls, threads = [], []
-    real_thread = threading.Thread
+    monkeypatch.setattr(constants, "_scratch_prune_thread", None, raising=False)
+    release, calls = threading.Event(), []
 
-    def tracked_thread(*args, **kwargs):
-        thread = real_thread(*args, **kwargs)
-        if thread.name == "scratch-prune":
-            threads.append(thread)
-        return thread
+    def blocked_prune(scratch):
+        calls.append(scratch)
+        release.wait(timeout=3)
 
-    monkeypatch.setattr(constants.threading, "Thread", tracked_thread)
-    monkeypatch.setattr(constants, "prune_scratch_dir", calls.append)
+    monkeypatch.setattr(constants, "prune_scratch_dir", blocked_prune)
     token = constants.set_hermes_home_override(None)
     try:
-        yield SimpleNamespace(home=home, calls=calls, threads=threads)
+        yield SimpleNamespace(home=home, calls=calls, release=release)
     finally:
-        for thread in threads:
+        release.set()
+        thread = getattr(constants, "_scratch_prune_thread", None)
+        if thread is not None:
             thread.join(timeout=5)
             assert not thread.is_alive()
         constants.reset_hermes_home_override(token)
 
 
-def test_host_hints_do_not_wait_for_scratch_prune(background_scratch_prune, monkeypatch):
+def _finish_prune(state):
     import hermes_constants as constants
+
+    state.release.set()
+    constants._scratch_prune_thread.join(timeout=5)
+
+
+def test_boot_hook_and_prompt_never_wait_for_the_scratch_prune(blocked_scratch_prune):
+    """The boot hook returns with TMPDIR pointing at a scratch dir that already exists, and the
+    prune it triggered runs once, later, on that dir; the prompt build does not start another."""
     from agent.prompt_builder import _local_host_hints
 
-    state = background_scratch_prune
-
-    def slow_prune(scratch):
-        state.calls.append(scratch)
-        time.sleep(2)  # health: allow HX013 -- simulate the slow prune specified by the regression
-
-    monkeypatch.setattr(constants, "prune_scratch_dir", slow_prune)
-    start = time.monotonic()
-    hints = _local_host_hints()
-    elapsed = time.monotonic() - start
-    assert elapsed < 0.5
-    assert len(state.threads) == 1
-    thread = state.threads[0]
-    assert thread.daemon
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    state = blocked_scratch_prune
     scratch = state.home / "cache" / "scratch"
+    env = {"HERMES_HOME": str(state.home)}
+    start = time.monotonic()
+    assert apply_scratch_tmp_env(env) is True
+    hints = _local_host_hints()
+    assert time.monotonic() - start < 1.0
+    assert env["TMPDIR"] == str(scratch) and scratch.is_dir()
+    assert f"Scratch directory: {scratch} (TMPDIR points here" in hints[0]
+    _finish_prune(state)
     assert state.calls == [scratch]
-    assert f"Scratch directory: {scratch} (TMPDIR points here; write temporary files " in hints[0]
 
 
-def test_host_hints_schedule_only_one_scratch_prune(background_scratch_prune, monkeypatch):
+def test_background_prune_targets_the_routed_home(blocked_scratch_prune, tmp_path):
+    """Threads do not inherit the profile override: the prune must use the scratch dir the
+    routed caller resolved, never the launch home's."""
     import hermes_constants as constants
-    from agent.prompt_builder import _local_host_hints
 
-    state = background_scratch_prune
-    release = threading.Event()
-    prune_once = constants._prune_scratch_dir_once
-
-    def delayed_prune(scratch):
-        release.wait(timeout=5)
-        prune_once(scratch)
-
-    monkeypatch.setattr(constants, "_prune_scratch_dir_once", delayed_prune)
+    state = blocked_scratch_prune
+    routed = tmp_path / "routed"
+    token = constants.set_hermes_home_override(routed)
     try:
-        _local_host_hints()
-        _local_host_hints()
-        assert len(state.threads) == 1
-    finally:
-        release.set()
-        for thread in state.threads:
-            thread.join(timeout=5)
-    _local_host_hints()
-    assert len(state.threads) == 1
-    assert state.calls == [state.home / "cache" / "scratch"]
-
-
-def test_host_hints_scratch_prune_uses_routed_home(background_scratch_prune, tmp_path):
-    import hermes_constants as constants
-    from agent.prompt_builder import _local_host_hints
-
-    state = background_scratch_prune
-    routed_home = tmp_path / "routed"
-    token = constants.set_hermes_home_override(routed_home)
-    try:
-        hints = _local_host_hints()
+        start = time.monotonic()
+        scratch = get_scratch_dir()
+        assert time.monotonic() - start < 1.0
     finally:
         constants.reset_hermes_home_override(token)
-    assert len(state.threads) == 1
-    thread = state.threads[0]
-    thread.join(timeout=5)
-    assert not thread.is_alive()
-    scratch = routed_home / "cache" / "scratch"
+    _finish_prune(state)
+    assert scratch == routed / "cache" / "scratch"
     assert state.calls == [scratch]
-    assert f"Scratch directory: {scratch} (TMPDIR points here; write temporary files " in hints[0]
 
 
 def test_scratch_env_follows_home_and_respects_user_tmpdir(tmp_path):
