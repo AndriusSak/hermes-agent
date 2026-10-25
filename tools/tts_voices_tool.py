@@ -32,11 +32,8 @@ _FILTERS = ("gender", "age", "accent", "language")
 def check_tts_voices_requirements() -> bool:
     """Exposed only when ElevenLabs is the configured TTS provider and its key resolves."""
     from tools import tts_tool
-    try:
-        return (tts_tool.elevenlabs_voice_selection_active()
-                and bool(tts_tool._resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")))
-    except Exception:
-        return False
+    return (tts_tool.elevenlabs_voice_selection_active()
+            and bool(tts_tool._resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")))
 
 
 def _clip(text: Any) -> str:
