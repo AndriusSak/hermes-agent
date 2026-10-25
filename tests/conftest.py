@@ -119,6 +119,12 @@ def _hermes_home_points_at_production(value: str) -> bool:
 # system default so the import-time hook stays a no-op. The parallel runner
 # exports its own disk-backed TMPDIR anyway.
 from hermes_constants import SCRATCH_DIR_MARKER_ENV, SCRATCH_TMP_ENV_VARS
+import hermes_constants
+
+# The hourly scratch prune runs in a detached child process; a test reaching get_scratch_dir()
+# would start a real one (and hand it to any Popen mock it installed). Tests of the prune
+# reset this flag.
+hermes_constants._scratch_pruned_once = True
 
 _HERMES_EXPORTED_TMP = os.environ.get(SCRATCH_DIR_MARKER_ENV, "")
 if _HERMES_EXPORTED_TMP:

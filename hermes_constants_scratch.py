@@ -160,19 +160,34 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def _own_lineage() -> set[int]:
-    """This process and its ancestors: never reap the shell that is running the prune."""
+# A detached pass (hermes_constants_scratch_detach) is reparented once the Hermes command that
+# launched it exits; that command's ancestors, captured when the pass starts, stay its own.
+_launcher_lineage: set[int] = set()
+
+
+def _lineage(pid: int | None = None) -> set[int]:
     import psutil
 
     pids: set[int] = set()
     try:
-        proc = psutil.Process()
+        proc = psutil.Process(pid)
         while proc is not None and proc.pid not in pids:
             pids.add(proc.pid)
             proc = proc.parent()
     except (psutil.Error, OSError):
         pass
     return pids
+
+
+def adopt_launcher_lineage(pids: tuple[int, ...]) -> None:
+    for pid in pids:
+        _launcher_lineage.update(_lineage(pid))
+
+
+def _own_lineage() -> set[int]:
+    """This process and its ancestors (and its launcher's): never reap the shell that is
+    running the prune."""
+    return _lineage() | _launcher_lineage
 
 
 def _registered_live_pids(home: Path) -> set[int]:

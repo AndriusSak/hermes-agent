@@ -7,10 +7,8 @@ import shutil
 import stat
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.waiting import wait_until
@@ -22,76 +20,73 @@ from hermes_constants import apply_scratch_tmp_env, get_scratch_dir, prune_scrat
 
 
 @pytest.fixture
-def blocked_scratch_prune(tmp_path, monkeypatch):
-    """A once-per-process prune that is still due and blocks until released: a caller that
-    waits on it shows up as a stall, one that does not returns at once."""
+def spawned_prunes(monkeypatch):
+    """A once-per-process prune that is still due; records each process spawned for it."""
     import hermes_constants as constants
+
+    monkeypatch.setattr(constants, "_scratch_pruned_once", False)
+    spawned = []
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: spawned.append(argv))
+    token = constants.set_hermes_home_override(None)
+    yield spawned
+    constants.reset_hermes_home_override(token)
+
+
+def test_boot_hook_and_prompt_hand_the_prune_to_one_child(spawned_prunes, tmp_path, monkeypatch):
+    """The boot hook returns with TMPDIR pointing at a scratch dir that already exists and
+    starts exactly one prune process, for that dir; the prompt build starts no other. A routed
+    caller's process prunes the routed home's dir, never the launch home's."""
+    import hermes_constants as constants
+    from agent.prompt_builder import _local_host_hints
 
     home = tmp_path / "launch"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(constants, "_scratch_pruned_once", False)
-    monkeypatch.setattr(constants, "_scratch_prune_thread", None, raising=False)
-    release, calls = threading.Event(), []
-
-    def blocked_prune(scratch):
-        calls.append(scratch)
-        release.wait(timeout=3)
-
-    monkeypatch.setattr(constants, "prune_scratch_dir", blocked_prune)
-    token = constants.set_hermes_home_override(None)
-    try:
-        yield SimpleNamespace(home=home, calls=calls, release=release)
-    finally:
-        release.set()
-        thread = getattr(constants, "_scratch_prune_thread", None)
-        if thread is not None:
-            thread.join(timeout=5)
-            assert not thread.is_alive()
-        constants.reset_hermes_home_override(token)
-
-
-def _finish_prune(state):
-    import hermes_constants as constants
-
-    state.release.set()
-    constants._scratch_prune_thread.join(timeout=5)
-
-
-def test_boot_hook_and_prompt_never_wait_for_the_scratch_prune(blocked_scratch_prune):
-    """The boot hook returns with TMPDIR pointing at a scratch dir that already exists, and the
-    prune it triggered runs once, later, on that dir; the prompt build does not start another."""
-    from agent.prompt_builder import _local_host_hints
-
-    state = blocked_scratch_prune
-    scratch = state.home / "cache" / "scratch"
-    env = {"HERMES_HOME": str(state.home)}
-    start = time.monotonic()
+    scratch = home / "cache" / "scratch"
+    env = {"HERMES_HOME": str(home)}
     assert apply_scratch_tmp_env(env) is True
     hints = _local_host_hints()
-    assert time.monotonic() - start < 1.0
     assert env["TMPDIR"] == str(scratch) and scratch.is_dir()
     assert f"Scratch directory: {scratch} (TMPDIR points here" in hints[0]
-    _finish_prune(state)
-    assert state.calls == [scratch]
+    assert len(spawned_prunes) == 1 and str(scratch) in spawned_prunes[0]
 
-
-def test_background_prune_targets_the_routed_home(blocked_scratch_prune, tmp_path):
-    """Threads do not inherit the profile override: the prune must use the scratch dir the
-    routed caller resolved, never the launch home's."""
-    import hermes_constants as constants
-
-    state = blocked_scratch_prune
+    monkeypatch.setattr(constants, "_scratch_pruned_once", False)  # the routed caller's own process
     routed = tmp_path / "routed"
     token = constants.set_hermes_home_override(routed)
     try:
-        start = time.monotonic()
-        scratch = get_scratch_dir()
-        assert time.monotonic() - start < 1.0
+        assert get_scratch_dir() == routed / "cache" / "scratch"
     finally:
         constants.reset_hermes_home_override(token)
-    _finish_prune(state)
-    assert scratch == routed / "cache" / "scratch"
-    assert state.calls == [scratch]
+    assert len(spawned_prunes) == 2 and str(routed / "cache" / "scratch") in spawned_prunes[1]
+    assert str(scratch) not in spawned_prunes[1]
+
+
+def _idle_entry(scratch: Path, name: str) -> Path:
+    entry = scratch / name
+    (entry / "sub").mkdir(parents=True)
+    (entry / "sub" / "out.log").write_text("old output", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (entry / "sub" / "out.log", entry / "sub", entry):
+        os.utime(path, (ancient, ancient))
+    return entry
+
+
+def test_a_short_lived_process_still_completes_its_due_prune(tmp_path):
+    """A `hermes` command that exits right after boot still gets its pass: the detached child
+    removes the idle entry of the (routed) home the command resolved, after the command is gone,
+    and leaves the launch home alone. Red on a daemon-thread prune, which dies with the command."""
+    launch, routed = tmp_path / "launch", tmp_path / "routed"
+    kept = _idle_entry(get_scratch_dir(launch, prune=False), "launch-lane")
+    doomed = _idle_entry(get_scratch_dir(routed, prune=False), "routed-lane")
+    repo = Path(__file__).resolve().parents[1]
+    launcher = ("import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import hermes_constants as h; "
+                "h.set_hermes_home_override(Path(sys.argv[2])); h.get_scratch_dir()")
+    env = {**os.environ, "HERMES_HOME": str(launch)}
+    subprocess.run([sys.executable, "-c", launcher, str(repo), str(routed)], env=env, cwd=tmp_path,
+                   stdin=subprocess.DEVNULL, check=True, timeout=60)
+    wait_until(lambda: not doomed.exists(), timeout=60, what="the detached prune removing the idle entry")
+    assert kept.exists()
+    log = (routed / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"removed {str(doomed)!r} (" in log, log
 
 
 def test_scratch_env_follows_home_and_respects_user_tmpdir(tmp_path):

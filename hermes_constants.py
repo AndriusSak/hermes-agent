@@ -9,7 +9,6 @@ import re
 import shutil
 import stat
 import sys
-import threading
 from collections.abc import Callable, Mapping, MutableMapping
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -816,8 +815,6 @@ SCRATCH_MAX_IDLE_HOURS = 24
 _SCRATCH_PRUNE_STAMP = ".last_prune"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
-_scratch_prune_lock = threading.Lock()
-_scratch_prune_thread: threading.Thread | None = None
 
 # AF_UNIX socket paths cap at 104 bytes (macOS) / 108 (Linux). Chrome appends
 # ``com.google.Chrome.XXXXXX/SingletonSocket`` (~45) and the code kernel
@@ -969,9 +966,10 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     :func:`export_scratch_tmp_env`), so ``tempfile`` defaults land here without call sites
     knowing. Entries idle for ``SCRATCH_MAX_IDLE_HOURS`` are pruned at most once per process
     and once per hour across processes (stamp file), so a fan-out of children stays cheap.
-    *prune* only schedules that pass on a daemon thread: the directory itself is created and
-    permissioned before this returns, but no caller (the boot hook included) waits on the
-    idle scan or the ``rmtree`` of a multi-GB entry.
+    The pass itself runs in a detached child process (``hermes_constants_scratch_detach``): the
+    directory is created and permissioned before this returns, no caller (the boot hook
+    included) waits on the idle scan or the ``rmtree`` of a multi-GB entry, and the pass still
+    finishes when the caller is a ``hermes`` command that exits a moment later.
 
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
@@ -987,7 +985,7 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     except OSError:
         pass
     if prune:
-        prune_scratch_dir_in_background(scratch)
+        _prune_scratch_dir_once(scratch)
     return scratch
 
 
@@ -1018,30 +1016,9 @@ def _prune_scratch_dir_once(scratch: Path) -> None:
         pass
     with contextlib.suppress(Exception):
         stamp.touch()
-        prune_scratch_dir(scratch)
+        from hermes_constants_scratch_detach import spawn_prune
 
-
-def prune_scratch_dir_in_background(scratch: Path) -> None:
-    """Schedule one prune of the *scratch* the caller resolved, without blocking it.
-
-    The thread gets the path, never re-resolves it: threads do not inherit the profile-override
-    contextvar. A process that exits mid-prune kills the daemon thread with the hourly stamp
-    already touched; every deletion is re-validated right before it happens, so a cut pass only
-    leaves fewer entries removed. Entries it never reached go on the next hourly pass; the one
-    cut inside ``rmtree`` has fresh directory mtimes from the unlinks, so its remainder goes
-    24 h later like any other entry written to."""
-    global _scratch_prune_thread
-    if _scratch_pruned_once:
-        return
-    with _scratch_prune_lock:
-        if _scratch_pruned_once or _scratch_prune_thread is not None:
-            return
-        # health: allow HX012 -- the caller's resolved path is passed in; nothing in the prune reads the scope
-        _scratch_prune_thread = threading.Thread(
-            target=_prune_scratch_dir_once, args=(scratch,), name="scratch-prune", daemon=True,
-        )
-        with contextlib.suppress(RuntimeError):
-            _scratch_prune_thread.start()
+        spawn_prune(scratch)
 
 
 def scratch_dir_usage_bytes(scratch: Path | None = None) -> int:
