@@ -999,7 +999,7 @@ class _OptimizeProgress:
     table), space-padded over the previous text (``ESC[K`` leaks under prompt_toolkit)."""
 
     def __init__(self):
-        self._key, self._last, self._width = None, None, 0
+        self._key, self._last, self._line = None, None, ""
 
     def __call__(self, info) -> None:
         phase = info.get("phase")
@@ -1014,16 +1014,24 @@ class _OptimizeProgress:
         self._draw(_optimize_progress_line(info))
 
     def _draw(self, line: str) -> None:
-        print(f"\r{line}{' ' * max(0, self._width - len(line))}", end="", flush=True)
-        self._width = len(line)
+        if line == self._line:  # a table's final chunk, its DROP and the switch all report 100%
+            return
+        print(f"\r{line}{' ' * max(0, len(self._line) - len(line))}", end="", flush=True)
+        self._line = line
 
     def close(self, completed: bool = False) -> None:
         last = self._last
         if completed and last and last.get("phase") in ("backfill", "teardown"):
             self._draw(_optimize_progress_line({**last, "percent": 100, "indexed": last.get("total", 0)}))
-        if self._width:
+        if self._line:
             print(flush=True)
-        self._last, self._width = None, 0
+        self._last, self._line = None, ""
+
+
+def _store_has_foreign_holder(db_path) -> bool:
+    from hermes_state_holders import held_store_refusal
+
+    return held_store_refusal(db_path, command="optimize-storage") is not None
 
 
 def _cmd_optimize_storage(db, args):
@@ -1060,10 +1068,19 @@ def _cmd_optimize_storage(db, args):
         if resp not in ("y", "yes"):
             print("Cancelled.")
             return
+    # The holder check was skipped under --force: if someone really holds the store, keep the old
+    # duty-cycle pause so their writes are not starved (slower, but they stay responsive).
+    yield_to_writers = bool(getattr(args, "force", False)) and _store_has_foreign_holder(db_path)
+    if yield_to_writers:
+        print("  Another process is using the database (--force): pacing the rebuild so it stays responsive.")
     progress = _OptimizeProgress()
     print("Optimizing search-index storage…")
     try:
-        result = db.optimize_fts_storage(progress_cb=progress, vacuum=do_vacuum)
+        result = db.optimize_fts_storage(progress_cb=progress, vacuum=do_vacuum, yield_to_writers=yield_to_writers)
+    except KeyboardInterrupt:
+        progress.close()
+        print("Interrupted — no data was lost; re-run to resume.")
+        return 130
     except Exception as e:
         progress.close()
         print(f"Error: optimization failed: {e}\nNo data was lost. Re-run to resume.")

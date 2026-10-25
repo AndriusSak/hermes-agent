@@ -542,18 +542,24 @@ class SessionFtsSetupMixin:
     # foreground `hermes sessions optimize-storage`, which refuses while any other
     # process holds state.db (held_store_refusal, #110054), so there is no writer
     # to yield to; a fixed 0.2 s pause after each few-ms chunk was >95% of the
-    # wall time. Chunk size adapts toward TARGET seconds, since rows cost ~1000x
-    # more in trigram_data than in docsize.
-    _FTS_REBUILD_CHUNK_ROWS = 500       # first chunk; later ones adapt
+    # wall time. Chunk size (in ROWS, never an id span: a pruned store has id gaps)
+    # adapts toward TARGET seconds, since rows cost ~1000x more in trigram_data
+    # than in docsize. `--force` past a live holder (yield_to_writers) keeps the
+    # duty cycle instead: chunks near PACED_TARGET, a pause of max(MIN_PAUSE,
+    # cost x DUTY_FACTOR) after each, so that holder's writes are not starved.
+    _FTS_REBUILD_CHUNK_ROWS = 500       # first chunk of every phase and trash table; later ones adapt
     _FTS_REBUILD_CHUNK_MIN_ROWS = 50
-    _FTS_REBUILD_CHUNK_MAX_ROWS = 1_000_000
+    _FTS_REBUILD_CHUNK_MAX_ROWS = 100_000
     _FTS_REBUILD_CHUNK_TARGET_S = 0.25
-    _fts_chunk_rows = _FTS_REBUILD_CHUNK_ROWS  # rows per step; optimize's _drive adapts it per instance
+    _FTS_REBUILD_PACED_TARGET_S = 0.05
+    _FTS_REBUILD_DUTY_FACTOR = 4.0      # paced: sleep >= 4x chunk cost (≤20% duty)
+    _FTS_REBUILD_MIN_PAUSE = 0.2        # paced: seconds — floor between chunks
+    _fts_chunk_rows = _FTS_REBUILD_CHUNK_ROWS  # rows per step; optimize's drive loop adapts it per instance
 
-    def _next_chunk_rows(self, rows: int, cost_s: float) -> int:
-        """Rows for the next chunk so it costs about ``_FTS_REBUILD_CHUNK_TARGET_S``; at most
-        doubles or halves per step so one noisy chunk (a cold page, a checkpoint) can't swing it."""
-        scale = self._FTS_REBUILD_CHUNK_TARGET_S / max(cost_s, 1e-4)
+    def _next_chunk_rows(self, rows: int, cost_s: float, target_s: float) -> int:
+        """Rows for the next chunk so it costs about *target_s*; at most doubles or halves per
+        step so one noisy chunk (a cold page, a checkpoint) can't swing it."""
+        scale = target_s / max(cost_s, 1e-4)
         rows = int(rows * min(2.0, max(0.5, scale)))
         return min(self._FTS_REBUILD_CHUNK_MAX_ROWS, max(self._FTS_REBUILD_CHUNK_MIN_ROWS, rows))
 
