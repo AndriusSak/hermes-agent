@@ -313,6 +313,12 @@ set `maintenance.commit-graph.enabled`, `gc.writeCommitGraph` and `fetch.writeCo
 downloads every one of their trees. Leave those settings alone, and leave `gc.auto` at its
 default so git's own automatic gc can still fold packs.
 
+Hermes keeps the commit-graph current itself, because without one every version lookup walks the
+whole history: a `hermes -w` launch updates a missing or day-old graph in the background with
+`git commit-graph write --reachable --split --no-changed-paths`, which reads commits only and never
+downloads a tree. A `commit-graph.lock` or `multi-pack-index.lock` that a killed git left behind is
+removed by the same stale-lock sweep as `index.lock` once it is 10 minutes old and no git is running.
+
 Each `hermes update` also spends at most 60 seconds cleaning those packs up, picking up where the
 previous update stopped. It deletes packs whose every object is also stored in another pack, then
 merges the smallest remaining packs while there are more than 50. Nothing stored locally is ever
