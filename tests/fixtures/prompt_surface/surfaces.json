@@ -5,7 +5,7 @@
       "stable": 1829,
       "volatile": 1528
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -26,6 +26,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -38,7 +39,7 @@
       "stable": 1225,
       "volatile": 1528
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -59,6 +60,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -71,7 +73,7 @@
       "stable": 1646,
       "volatile": 1527
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -92,6 +94,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -104,7 +107,7 @@
       "stable": 2420,
       "volatile": 1524
     },
-    "tool_tokens": 11398,
+    "tool_tokens": 11705,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -125,6 +128,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -137,7 +141,7 @@
       "stable": 1225,
       "volatile": 1528
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -158,6 +162,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -170,7 +175,7 @@
       "stable": 1211,
       "volatile": 1528
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -191,6 +196,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -203,7 +209,7 @@
       "stable": 1473,
       "volatile": 1529
     },
-    "tool_tokens": 11898,
+    "tool_tokens": 12205,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -225,6 +231,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -237,7 +244,7 @@
       "stable": 1244,
       "volatile": 1529
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -258,6 +265,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",
@@ -270,7 +278,7 @@
       "stable": 1276,
       "volatile": 1529
     },
-    "tool_tokens": 11242,
+    "tool_tokens": 11549,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -291,6 +299,7 @@
       "tool_call",
       "tool_describe",
       "tool_search",
+      "tts_voices",
       "vision_analyze",
       "web_extract",
       "web_search",

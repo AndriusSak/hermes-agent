@@ -228,6 +228,18 @@ Without ffmpeg, Edge TTS, MiniMax TTS, NeuTTS, KittenTTS, and Piper audio are se
 If you want voice bubbles without installing ffmpeg, switch to the OpenAI, ElevenLabs, or Mistral provider.
 :::
 
+### ElevenLabs: agent-selected voices
+
+With `tts.provider: elevenlabs` and `ELEVENLABS_API_KEY` set, the agent can pick a different voice for each `text_to_speech` call, for example one voice per character in a script. Two things appear only for ElevenLabs (other providers keep the configured voice and see neither):
+
+- `text_to_speech` gains an optional `voice_id`. Leaving it out uses `tts.elevenlabs.voice_id`; the config is never rewritten.
+- The `tts_voices` tool searches voices, 20 per page by default (up to 100), with `next_page` for the following page:
+  - `source: account` (default) lists the voices on your account: premade ones plus anything you saved, cloned or designed.
+  - `source: library` searches the public Voice Library (thousands of community voices). ElevenLabs only allows library voices over the API on paid plans.
+  - Filters: free-text `query` (name, description, labels), `gender`, `age`, `accent`, `language` (ISO code like `en`).
+
+The agent can't listen to voices. It chooses from each voice's labels and description, and every result carries a `preview_url` you can open to hear the voice before committing to it.
+
 ### xAI Custom Voices (voice cloning)
 
 xAI supports cloning your voice and using it with TTS. Create a custom voice in the [xAI Console](https://console.x.ai/team/default/voice/voice-library), then set the resulting `voice_id` in your config:

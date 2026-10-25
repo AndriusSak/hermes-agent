@@ -305,6 +305,37 @@ def _apply_call_overrides(tts_config: dict[str, Any], speed: Optional[float], pr
     return tts_config, configured_provider
 
 
+# ElevenLabs voice ids are short alphanumeric tokens; anything else never reaches the URL path.
+_ELEVENLABS_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
+
+
+def elevenlabs_voice_selection_active(tts_config: Optional[dict[str, Any]] = None) -> bool:
+    """Whether the model may pick voices: built-in ElevenLabs is the configured provider (gates
+    the ``voice_id`` schema field and the ``tts_voices`` tool, so other providers see neither)."""
+    tts_config = _load_tts_config() if tts_config is None else tts_config
+    return (_get_provider(tts_config) == "elevenlabs"
+            and _resolve_command_provider_config("elevenlabs", tts_config) is None)
+
+
+def _apply_voice_override(tts_config: dict[str, Any], provider: str, voice_id: Optional[str]):
+    """Per-call ElevenLabs ``voice_id`` on a copy of the config -> ``(tts_config, error_json)``.
+    Ignored (logged) on any other provider: a schema cached before a provider switch may still
+    send it, and it must not fail the speech."""
+    voice_id = (voice_id or "").strip()
+    if not voice_id:
+        return tts_config, None
+    if provider != "elevenlabs" or not elevenlabs_voice_selection_active(tts_config):
+        logger.warning("Ignoring per-call TTS voice_id; tts.provider is %r", provider)
+        return tts_config, None
+    if not _ELEVENLABS_VOICE_ID_RE.match(voice_id):
+        return tts_config, tool_error(
+            f"Invalid ElevenLabs voice_id {voice_id!r}: use a voice_id returned by tts_voices.",
+            success=False)
+    section = dict(tts_config.get("elevenlabs") or {})
+    section["voice_id"] = voice_id
+    return {**tts_config, "elevenlabs": section}, None
+
+
 def _session_platform() -> tuple:
     """``(platform, wants_opus)`` — platforms delivering voice bubbles only as Ogg/Opus want Opus."""
     from gateway.session_context import get_session_env
@@ -456,7 +487,8 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
 
 def text_to_speech_tool(
     text: str, output_path: Optional[str] = None, speed: Optional[float] = None,
-    instructions: Optional[str] = None, provider: Optional[str] = None) -> str:
+    instructions: Optional[str] = None, provider: Optional[str] = None,
+    voice_id: Optional[str] = None) -> str:
     """Convert text to speech with long-form chunking; returns the JSON result envelope.
 
     Text is normalized, split into provider-safe chunks (never silently truncated), synthesized
@@ -472,6 +504,9 @@ def text_to_speech_tool(
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
+    tts_config, error = _apply_voice_override(tts_config, provider, voice_id)
+    if error:
+        return error
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
@@ -635,12 +670,22 @@ def _tts_schema_overrides() -> dict:
     would name the launch profile's home for everyone else (#95685)."""
     params = copy.deepcopy(TTS_SCHEMA["parameters"])
     params["properties"]["output_path"]["description"] = _output_path_description(display_hermes_home())
-    return {"parameters": params}
+    if not elevenlabs_voice_selection_active():
+        return {"parameters": params}
+    params["properties"]["voice_id"] = {
+        "type": "string",
+        "description": ("ElevenLabs voice for this audio (a voice_id from tts_voices). "
+                        "Omit to use the user's configured voice.")}
+    return {"parameters": params, "description": TTS_SCHEMA["description"].replace(
+        _CONFIGURED_VOICE_SENTENCE, _ELEVENLABS_VOICE_SENTENCE)}
 
+
+_CONFIGURED_VOICE_SENTENCE = "Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected."
+_ELEVENLABS_VOICE_SENTENCE = "The provider is user-configured (ElevenLabs); pick a voice per call with voice_id, found via tts_voices."
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected.",
+    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. " + _CONFIGURED_VOICE_SENTENCE,
     "parameters": {
         "type": "object",
         "properties": {
@@ -676,7 +721,7 @@ registry.register(
     schema=TTS_SCHEMA,
     handler=lambda args, **kw: text_to_speech_tool(
         text=args.get("text", ""),
-        **{k: args.get(k) for k in ("output_path", "speed", "instructions")}),
+        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id")}),
     check_fn=check_tts_requirements,
     emoji="🔊",
     dynamic_schema_overrides=_tts_schema_overrides)
