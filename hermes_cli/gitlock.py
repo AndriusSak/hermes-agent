@@ -34,6 +34,15 @@ STALE_TMP_PACK_MIN_AGE_SECONDS = STALE_LOCK_MIN_AGE_SECONDS
 # ``shallow.lock`` is the one observed in the wild; the others are the same class of failure
 # (interrupted git operation). Locks held by a live git process are protected by the process guard.
 LOCK_NAMES = ("shallow.lock", "index.lock", "HEAD.lock", "MERGE_HEAD.lock")
+# Object-store indexes a killed git (Hermes kills git trees on timeout) leaves locked. Each lock fails
+# every later write of that file, so the commit-graph that keeps ``git tag --merged`` and ancestry
+# walks fast stops refreshing for good (one sat on a real checkout for two months).
+OBJECT_STORE_LOCK_NAMES = (
+    "objects/info/commit-graph.lock",
+    "objects/info/commit-graphs/commit-graph-chain.lock",
+    "objects/pack/multi-pack-index.lock",
+    "objects/pack/multi-pack-index.d/multi-pack-index-chain.lock",
+)
 # Temp-file prefixes git writes into .git/objects/pack during a transfer and renames away on
 # success; anything left with these names after a fetch died is garbage by definition.
 # ``.tmp-<pid>-pack*`` is the same thing from ``pack-objects`` (repack/gc) killed mid-write.
@@ -100,7 +109,7 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
     """
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(
-        git_dir, lambda: [git_dir / name for name in LOCK_NAMES],
+        git_dir, lambda: [git_dir / name for name in (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES)],
         min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),

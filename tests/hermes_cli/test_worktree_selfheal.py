@@ -143,6 +143,28 @@ class TestMaintainPackHealth:
 
         _maintain_pack_health(str(tmp_path / "not-a-repo"))  # must not raise
 
+    def test_pass_refreshes_a_stale_commit_graph(self, repo):
+        """A graph that stopped covering HEAD makes every ``git tag --merged HEAD`` walk the gap."""
+        import os
+        import time
+
+        from hermes_cli import worktree_ops
+
+        _git(repo, "commit-graph", "write", "--reachable", "--no-progress")
+        old = time.time() - 3 * 86400
+        os.utime(repo / ".git" / "objects" / "info" / "commit-graph", (old, old))
+        (repo / "g.txt").write_text("y\n")
+        _git(repo, "add", "-A")
+        _git(repo, "-c", "maintenance.auto=false", "-c", "gc.auto=0", "commit", "-qm", "after the graph")
+
+        worktree_ops._maintain_pack_health(str(repo))
+
+        info = repo / ".git" / "objects" / "info"
+        written = [p.stat().st_mtime for p in (info / "commit-graph", info / "commit-graphs" / "commit-graph-chain")
+                   if p.is_file()]
+        assert written and max(written) > time.time() - 300, "the pass must write a graph covering the new commit"
+        _git(repo, "commit-graph", "verify")
+
 
 class TestRepackStampede:
     """Regression for the Sep 2026 shared-clone incident: every ``hermes -w`` launch started its

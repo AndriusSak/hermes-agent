@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
-from hermes_cli._subprocess_compat import kill_process_tree, noninteractive_git_env
+from hermes_cli._subprocess_compat import NO_LAZY_FETCH_ENV, kill_process_tree, noninteractive_git_env
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -123,17 +123,27 @@ _REPACK_TIMEOUT = 1800
 # concurrent multi-GB repacks (each too slow under the others to ever finish inside the timeout).
 _REPACK_MIN_INTERVAL = 6 * 3600
 _REPACK_LOCK = "hermes-repack.lock"
+# Generation numbers in the commit-graph keep ``git tag --merged HEAD`` (the version lookup) and
+# ancestry checks off a full history walk: on hermes-agent a graph two months behind cost 0.33 s
+# per lookup, a fresh one 0.04 s. Partial clones have git's own graph writers switched off
+# (gitlock._TREE0_MAINTENANCE_OFF, #127711), so nothing else refreshes it there. Without Bloom data
+# the write reads commits only, never trees, so it cannot start that lazy-fetch loop, and it costs
+# ~3 s instead of ~27 s when changed paths would be recomputed.
+_COMMIT_GRAPH_WRITE = ("commit-graph", "write", "--reachable", "--split", "--no-changed-paths", "--no-progress")
+_COMMIT_GRAPH_MAX_AGE = 24 * 3600
+_COMMIT_GRAPH_TIMEOUT = 600
+_COMMIT_GRAPH_LOCK = "hermes-commit-graph.lock"
 
 
-def _claim_repack_slot(git_dir: Path) -> bool:
-    """Exactly one process per clone gets to repack per ``_REPACK_MIN_INTERVAL``.
+def _claim_repack_slot(git_dir: Path, lock_name: str = _REPACK_LOCK) -> bool:
+    """Exactly one process per clone gets to run a maintenance job per ``_REPACK_MIN_INTERVAL``.
 
     The lock file's mtime is the stamp: younger than the interval means another launch is
-    repacking (or just tried and timed out) — skip. A stale lock is taken over by ``replace``,
+    running the job (or just tried and timed out) — skip. A stale lock is taken over by ``replace``,
     which only one of N racing processes can win; the O_EXCL create then serializes against a
     process that found no lock at all.
     """
-    lock = git_dir / _REPACK_LOCK
+    lock = git_dir / lock_name
     try:
         st = lock.stat()
     except FileNotFoundError:
@@ -156,20 +166,25 @@ def _claim_repack_slot(git_dir: Path) -> bool:
 
 
 def _run_bounded_repack(repo_root: str) -> None:
-    """Incremental geometric repack whose whole process tree dies with the timeout or with us.
+    """Incremental geometric repack whose whole process tree dies with the timeout or with us."""
+    _run_bounded_git(repo_root, ["repack", "-d", "--geometric=2", "--write-midx", "--quiet"], _REPACK_TIMEOUT)
+
+
+def _run_bounded_git(repo_root: str, args, timeout: float, env: Optional[dict] = None) -> None:
+    """Run a niced ``git *args`` whose whole process tree dies with the timeout or with us.
 
     ``repack`` forks ``pack-objects``; ``subprocess.run(timeout=)`` killed only the parent and
     left the grandchild packing for days, and a daemon thread's child outlived the CLI the same
     way. A new session/process group + ``atexit`` reaps both cases.
     """
-    cmd = ["git", "repack", "-d", "--geometric=2", "--write-midx", "--quiet"]
+    cmd = ["git", *args]
     if os.name == "posix":
         cmd = ["nice", "-n", "19", *cmd]
         group_kw: dict = {"process_group": 0}
     else:
         group_kw = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     proc = subprocess.Popen(cmd, cwd=repo_root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, **group_kw)
+                            stderr=subprocess.DEVNULL, env=env, **group_kw)
 
     def _reap() -> None:
         if proc.poll() is None:
@@ -177,14 +192,32 @@ def _run_bounded_repack(repo_root: str) -> None:
 
     atexit.register(_reap)
     try:
-        proc.wait(timeout=_REPACK_TIMEOUT)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         _reap()
-        logger.info("git repack exceeded %ds; killed (next attempt in %dh)", _REPACK_TIMEOUT, _REPACK_MIN_INTERVAL // 3600)
+        logger.info("git %s exceeded %ds; killed (next attempt in %dh)", args[0], timeout, _REPACK_MIN_INTERVAL // 3600)
+
+
+def _commit_graph_stale(git_dir: Path) -> bool:
+    """No commit-graph, or none written for a day (a write with no new commits leaves it untouched)."""
+    info = git_dir / "objects" / "info"
+    stamps = [p.stat().st_mtime for p in (info / "commit-graph", info / "commit-graphs" / "commit-graph-chain")
+              if p.is_file()]
+    return not stamps or time.time() - max(stamps) > _COMMIT_GRAPH_MAX_AGE
+
+
+def _refresh_commit_graph(repo_root: str) -> None:
+    from hermes_cli.gitlock import clear_stale_git_locks
+
+    # A writer killed mid-write strands commit-graph-chain.lock and every later write fails on it.
+    clear_stale_git_locks(Path(repo_root))
+    logger.info("git commit-graph missing or stale — writing it in background")
+    _run_bounded_git(repo_root, _COMMIT_GRAPH_WRITE, _COMMIT_GRAPH_TIMEOUT,
+                     env={**noninteractive_git_env(), **NO_LAZY_FETCH_ENV})
 
 
 def _maintain_pack_health(repo_root: str) -> None:
-    """Repack the object store when pack files sprawl (background thread, fail-soft).
+    """Repack on pack sprawl and keep the commit-graph fresh (background thread, fail-soft).
 
     ``gc --auto`` only fires at 50 packs; past a few dozen, every object lookup scans every
     pack index and worktree creation can blow its timeout under concurrent load.
@@ -193,18 +226,18 @@ def _maintain_pack_health(repo_root: str) -> None:
         pack_dir = Path(repo_root) / ".git" / "objects" / "pack"
         if not pack_dir.is_dir():
             return
+        git_dir = pack_dir.parent.parent
         packs = len(list(pack_dir.glob("*.pack")))
-        if packs < _PACK_SPRAWL_THRESHOLD:
-            return
-        if not _claim_repack_slot(pack_dir.parent.parent):
-            return
-        from hermes_cli.gitlock import clear_stale_tmp_packs
-        clear_stale_tmp_packs(Path(repo_root))
-        logger.info("git pack sprawl (%d packs) — repacking in background", packs)
-        _run_bounded_repack(repo_root)
-        # Repacking can strand now-duplicated admin files; prune on the same pass.
-        _git(["worktree", "prune"], repo_root, timeout=60, check=False,
-             stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+        if packs >= _PACK_SPRAWL_THRESHOLD and _claim_repack_slot(git_dir):
+            from hermes_cli.gitlock import clear_stale_tmp_packs
+            clear_stale_tmp_packs(Path(repo_root))
+            logger.info("git pack sprawl (%d packs) — repacking in background", packs)
+            _run_bounded_repack(repo_root)
+            # Repacking can strand now-duplicated admin files; prune on the same pass.
+            _git(["worktree", "prune"], repo_root, timeout=60, check=False,
+                 stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+        if _commit_graph_stale(git_dir) and _claim_repack_slot(git_dir, _COMMIT_GRAPH_LOCK):
+            _refresh_commit_graph(repo_root)
     except Exception as e:
         logger.debug("pack maintenance skipped: %s", e)
 
