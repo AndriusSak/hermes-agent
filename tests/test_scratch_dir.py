@@ -76,12 +76,16 @@ def test_a_short_lived_process_still_completes_its_due_prune(tmp_path):
     shell = [sys.executable, "-c", run.format(str(tmp_path)) + "; import time; time.sleep(120)", *wrapper]
     env = {**os.environ, "HERMES_HOME": str(launch)}
     user_shell = subprocess.Popen(shell, env=env, cwd=shell_entry / "sub", stdin=subprocess.DEVNULL)
+    log_file = routed / "logs" / "scratch-prune.log"
+
+    def removal_logged():  # the record follows the rmtree, so wait for it, not for the path
+        return log_file.exists() and f"removed {str(doomed)!r} (" in log_file.read_text(encoding="utf-8-sig")
+
     try:
-        wait_until(lambda: not doomed.exists(), timeout=60, what="the detached prune removing the idle entry")
-        assert kept.exists() and shell_entry.exists()
+        wait_until(removal_logged, timeout=60, what="the detached prune removing the idle entry")
+        assert not doomed.exists() and kept.exists() and shell_entry.exists()
         assert user_shell.poll() is None, "the user's shell was signalled"
-        log = (routed / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
-        assert f"removed {str(doomed)!r} (" in log, log
+        log = log_file.read_text(encoding="utf-8-sig")
         assert f"kept {str(shell_entry)!r} — live Hermes process pid={user_shell.pid}" in log, log
     finally:
         user_shell.kill()
