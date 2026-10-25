@@ -205,7 +205,9 @@ def _own_lineage() -> set[int] | None:
         pass
     for pid, started in _launcher_lineage:
         with contextlib.suppress(psutil.Error, OSError):
-            if psutil.Process(pid).create_time() == started:
+            # Tolerance, as for the spawn ledger: Linux create_time adds a whole-second boot time
+            # psutil re-reads per call, which moves when the clock steps (NTP, resume, VM sync).
+            if abs(psutil.Process(pid).create_time() - started) < 2.0:
                 pids.add(pid)
     return pids
 
