@@ -268,8 +268,10 @@ with its working directory inside that entry (or inside a scratch path that no l
 such as a headless browser left behind by a test run) and drops any `git worktree`
 registration that pointed into it. A process Hermes itself started and still tracks (a
 background `terminal` process, the gateway, a CLI session, or anything they launched that is
-still their child) is never stopped: an idle entry one of them is working inside is kept
-instead. Each entry is re-checked right before it is deleted, so
+still their child) is never stopped, and neither is the shell that started the Hermes command
+(or its parents), even after that command exited: an idle entry one of them is working inside
+is kept instead. A pass that cannot inspect processes stops nothing and deletes no entry a
+process may be working in. Each entry is re-checked right before it is deleted, so
 one written to while the prune was stopping processes is kept. Every removal, stopped
 process and kept entry is recorded in `~/.hermes/logs/scratch-prune.log`. An entry holding
 files your user may not read or delete (typically root-owned output of a Docker container that

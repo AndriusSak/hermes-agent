@@ -160,34 +160,54 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-# A detached pass (hermes_constants_scratch_detach) is reparented once the Hermes command that
-# launched it exits; that command's ancestors, captured when the pass starts, stay its own.
-_launcher_lineage: set[int] = set()
+# The ancestry of the Hermes command that launched a detached pass (hermes_constants_scratch_detach),
+# as ``(pid, create_time)`` pairs the launcher computed before it spawned the pass: the pass is
+# reparented once that command exits, so its own ancestry no longer reaches the user's shell.
+# ``None``: the launcher could not compute it, so the pass signals nothing and keeps every entry
+# a live process works in.
+_launcher_lineage: frozenset[tuple[int, float]] | None = frozenset()
 
 
-def _lineage(pid: int | None = None) -> set[int]:
+def lineage_with_start_times() -> list[tuple[int, float]] | None:
+    """This process and its ancestors with their create times, the set :func:`_own_lineage`
+    computes in-process, in a form that stays checkable after they exit. ``None`` when it
+    cannot be computed completely (no psutil, a process that refuses inspection)."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    chain: dict[int, float] = {}
+    try:
+        proc = psutil.Process()
+        while proc is not None and proc.pid not in chain:
+            chain[proc.pid] = proc.create_time()
+            proc = proc.parent()
+    except (psutil.Error, OSError):
+        return None
+    return list(chain.items())
+
+
+def _own_lineage() -> set[int] | None:
+    """This process and its ancestors: never reap the shell that is running the prune. A
+    detached pass adds its launcher's ancestors that still run under the same create time (a
+    reused pid is not spared), and returns ``None`` (spare every process) without them."""
     import psutil
 
+    if _launcher_lineage is None:
+        return None
     pids: set[int] = set()
     try:
-        proc = psutil.Process(pid)
+        proc = psutil.Process()
         while proc is not None and proc.pid not in pids:
             pids.add(proc.pid)
             proc = proc.parent()
     except (psutil.Error, OSError):
         pass
+    for pid, started in _launcher_lineage:
+        with contextlib.suppress(psutil.Error, OSError):
+            if psutil.Process(pid).create_time() == started:
+                pids.add(pid)
     return pids
-
-
-def adopt_launcher_lineage(pids: tuple[int, ...]) -> None:
-    for pid in pids:
-        _launcher_lineage.update(_lineage(pid))
-
-
-def _own_lineage() -> set[int]:
-    """This process and its ancestors (and its launcher's): never reap the shell that is
-    running the prune."""
-    return _lineage() | _launcher_lineage
 
 
 def _registered_live_pids(home: Path) -> set[int]:
@@ -282,7 +302,7 @@ def reap_processes_rooted_in(scratch_root: Path, doomed: list[Path], audit: logg
         if not _under(cwd_path, root):
             continue
         if deleted or not os.path.exists(cwd_path) or any(_under(cwd_path, t) for t in targets):
-            (lineage if proc.pid in skip else victims).append((proc, cwd_path))
+            (lineage if skip is None or proc.pid in skip else victims).append((proc, cwd_path))
     # The owning home comes from the scratch path as configured, not its resolved target:
     # a cache/scratch symlinked onto another disk still belongs to <home>.
     registered = _registered_live_pids(Path(scratch_root).absolute().parent.parent) if victims else set()
@@ -406,8 +426,11 @@ def _prune_idle_entries(
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:
         reap_processes_rooted_in(root, doomed, audit)
-    except Exception as exc:  # psutil missing or restricted host: the deletion still proceeds
-        logger.debug("scratch prune: process reap skipped: %s", exc, exc_info=True)
+    # health: allow BLE001 -- fail-closed boundary: any failure leaves who works inside unknown; audited below
+    except Exception as exc:  # psutil missing or restricted host
+        audit.info("scratch prune: process check failed (%s: %r), nothing deleted this pass",
+                   type(exc).__name__, str(exc))
+        return 0
     if not doomed:
         return 0
     repos: set[str] = set()
