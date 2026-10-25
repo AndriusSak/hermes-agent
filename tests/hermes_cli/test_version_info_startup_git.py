@@ -27,10 +27,17 @@ def _run_logging_git(tmp_path: Path, code: str) -> tuple[dict, list[str]]:
     # .git (sdist/archive test runs); give it a tagged checkout so the release walk always has one.
     repo = home / "hermes-agent"
     repo.mkdir(parents=True)
-    git = [real_git, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(repo)]
-    subprocess.run([*git, "init", "-q"], check=True)
-    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "r"], check=True)
-    subprocess.run([*git, "tag", "v1.2.3"], check=True)
+    # The fixture's own git ignores the developer's config (signing, hooks): run_tests.sh keeps the
+    # real HOME, so a global commit.gpgsign would otherwise prompt for or fail on a key.
+    fixture_env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    git = [real_git, "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-C", str(repo)]
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "r"], ["tag", "v1.2.3"]):
+        subprocess.run([*git, *args], check=True, env=fixture_env)
 
     log = tmp_path / "git.log"
     bindir = tmp_path / "bin"
