@@ -101,3 +101,25 @@ def test_tts_voices_rejects_a_non_numeric_library_page():
          patch("tools.tts_voices_tool.httpx.get") as get:
         result = json.loads(tts_voices_tool.tts_voices_tool(source="library", page="tok-2"))
     assert not result["success"] and get.call_count == 0
+
+
+def test_provider_switch_shows_and_hides_tts_voices_at_once(monkeypatch):
+    """The check is config-backed and uncached: a switch to ElevenLabs right after an Edge
+    listing must expose tts_voices (a cached False would stick under the new fingerprint)."""
+    import os
+
+    import model_tools
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test-key")
+    config_path = get_hermes_home() / "config.yaml"
+
+    def listed(provider: str, stamp: int) -> set:
+        config_path.write_text(f"tts:\n  provider: {provider}\n")
+        os.utime(config_path, (stamp, stamp))
+        defs = model_tools.get_tool_definitions(enabled_toolsets=["tts"], quiet_mode=True)
+        return {d["function"]["name"] for d in defs}
+
+    assert "tts_voices" not in listed("edge", 1_700_000_000)
+    assert "tts_voices" in listed("elevenlabs", 1_700_000_100)
+    assert "tts_voices" not in listed("edge", 1_700_000_200)

@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 import httpx
 
-from tools.registry import registry, tool_error
+from tools.registry import no_cache_check_fn, registry, tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ _TIMEOUT_SECONDS = 20.0
 _FILTERS = ("gender", "age", "accent", "language")
 
 
+@no_cache_check_fn  # config-backed and local: a provider switch must show/hide it at once
 def check_tts_voices_requirements() -> bool:
     """Exposed only when ElevenLabs is the configured TTS provider and its key resolves."""
     from tools import tts_tool
